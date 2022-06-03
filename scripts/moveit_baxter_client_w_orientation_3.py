@@ -24,9 +24,17 @@ from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 from trac_ik_python.trac_ik import IK
 
+from deformernet_utils import deformernet_client
 
-home_left = {'left_w0': -0.44787147919529247, 'left_w1': -0.030359275227683113, 'left_w2': -0.050288503724890354, 'left_e0': 0.007414220958978035, 'left_e1': 0.5036717340443388, 'left_s0': 0.19083392898149576, 'left_s1': 1.0470047162936567}
-home_right = {'right_s0': -0.35752707674516415, 'right_s1': 1.047003659427773, 'right_w0': -0.27829191032360523, 'right_w1': 0.0357530468626619, 'right_w2': 0.11129875866436478, 'right_e0': 0.006869317940742192, 'right_e1': 0.5046978395373198}
+
+"""To modify baxter.urdf
+1) Measure length L of the baxter from the end of the end-effector (left_gripper_base link) (the part right before the left/right parralel grippers
+2) Modify "laparoscopic_tool" (both visual and collision) <box size="L 0.005 0.005" />
+3) Modify "laparoscopic_tool" origins -> L/2 + 0.018; 0.018: some offset from the left_gripper_base to the actual end of ee; e.g. if L = 0.3: <origin xyz="0 0 0.168" rpy="0 1.570796327 0 " />
+4) Mdoify "laparoscopic_tool_tip" <joint name="dummy_joint" type="fixed">: <origin rpy="0 0 0" xyz="0.0 0.0 (L + 0.018)"/>
+"""
+
+
 
 
 def obtain_waypoints(current_pose, delta_pos, delta_euler, num_wp=10):
@@ -38,11 +46,10 @@ def obtain_waypoints(current_pose, delta_pos, delta_euler, num_wp=10):
     goal_euler = np.array(delta_euler) + np.array(current_euler)
     
     euler = np.concatenate((np.array([current_euler]), [goal_euler]), axis=0)
-    # print(euler.shape)
     key_rots = R.from_euler('xyz', euler)
     key_times = [0,1]
     slerp = Slerp(key_times, key_rots)
-    times = np.linspace(start=0,stop=1,num=num_wp) #range(0,10)
+    times = np.linspace(start=0,stop=1,num=num_wp) 
     interp_rots = slerp(times)
     # print(key_rots.as_euler('xyz'), interp_rots.as_euler('xyz'))
     interp_eulers = interp_rots.as_euler('xyz')
@@ -61,21 +68,20 @@ def obtain_waypoints(current_pose, delta_pos, delta_euler, num_wp=10):
         target_pose.position.x = current_pose.position.x + interp_pos[i][0]
         target_pose.position.y = current_pose.position.y + interp_pos[i][1]
         target_pose.position.z = current_pose.position.z + interp_pos[i][2]   
-        # print("new_target:", [target_pose.position.x,target_pose.position.y,target_pose.position.z])     
-        # print("----------------------------")
+
 
         
-        target_pose.orientation.x = quat[0]    #current_pose.orientation.x +  
-        target_pose.orientation.y = quat[1]    #current_pose.orientation.y + 
-        target_pose.orientation.z = quat[2]    #current_pose.orientation.z + 
-        target_pose.orientation.w = quat[3]    #current_pose.orientation.w + 
+        target_pose.orientation.x = quat[0]     
+        target_pose.orientation.y = quat[1]    
+        target_pose.orientation.z = quat[2]    
+        target_pose.orientation.w = quat[3]    
         
         waypoints.append(copy.deepcopy(target_pose))
 
-    print("----------------------------")
-    print("init:", current_pose)
-    print("----------------------------")
-    print("final:", waypoints[-1])
+    # print("----------------------------")
+    # print("init:", current_pose)
+    # print("----------------------------")
+    # print("final:", waypoints[-1])
     return waypoints
 
 def moveit_baxter_example(delta_pos, delta_euler, num_wp=10):
@@ -85,12 +91,14 @@ def moveit_baxter_example(delta_pos, delta_euler, num_wp=10):
     # rospy.init_node('moveit_baxter_example', anonymous=True)
 
 
-    group = moveit_commander.MoveGroupCommander("left_arm")    
-
+    """ First. Obtain the new pose of "laparoscopic_tool_tip" (after adding the desired displacements) using group.get_current_pose()
+    Then, get desired joint angles with track_ik"""
+    
+    ### Set up
+    group = moveit_commander.MoveGroupCommander("left_arm")  
     ik_solver = IK("world", "laparoscopic_tool_tip")
     # print(ik_solver.joint_names)
-    seed_state = [0.0] * ik_solver.number_of_joints
-
+    # seed_state = [0.0] * ik_solver.number_of_joints
     arm = baxter_interface.Limb('left')
     robot_description = URDF.from_parameter_server()
     base_link = 'world'
@@ -98,84 +106,70 @@ def moveit_baxter_example(delta_pos, delta_euler, num_wp=10):
     kdl_kin = KDLKinematics(robot_description, base_link, end_link)
     robot = Robot(arm, kdl_kin)
 
-
-    left_current_pose = deepcopy(group.get_current_pose(end_effector_link='laparoscopic_tool_tip').pose)
-    # abc = robot.get_ee_cartesian_position()
-    # left_current_pose.position.x = abc[0]
-    # left_current_pose.position.y = abc[1]
-    # left_current_pose.position.z = abc[2]
-
-    seed_state = group.get_current_joint_values()
+    ### Add displacements to current pose
+    left_current_pose = deepcopy(group.get_current_pose(end_effector_link='laparoscopic_tool_tip').pose) # current pose of "laparoscopic_tool_tip"    
     eulers = transformations.euler_from_quaternion([left_current_pose.orientation.x, left_current_pose.orientation.y, left_current_pose.orientation.z, 
                                                     left_current_pose.orientation.w])
     eulers_new = np.array(eulers) + np.array(delta_euler)
     quat = transformations.quaternion_from_euler(*eulers_new)
 
+    ### Solve IK to obtain desired joint positions. 
+    seed_state = group.get_current_joint_values()
     ik_js = ik_solver.get_ik(seed_state, left_current_pose.position.x + delta_pos[0], left_current_pose.position.y + delta_pos[1], \
                             left_current_pose.position.z + delta_pos[2], \
                             *quat) 
+
+    ### Optional. Use KDLKinematics to find the goal pose to confirm the solution is correct.
     pos, temp = robot.get_left_gripper_from_joint_angles(np.array(ik_js))
-    euler = np.array([temp[2], -temp[1], -np.pi-temp[0]])
-    
+    euler = np.array([temp[2], -temp[1], -np.pi-temp[0]])   # Modify the eulers a bit to match the results between KDLKinematics and group.get_current_pose()   
     print("===================================")
     print([left_current_pose.position.x,left_current_pose.position.y,left_current_pose.position.z], np.array(eulers)*180/np.pi)
     print(pos, euler*180/np.pi)
     print("===================================")    
-    # abc = robot.get_ee_cartesian_position()
-    # print(abc[:3], transformations.euler_from_quaternion(abc[3:]))
+
+
+    """ Second. Compute the desired pose of the "left_gripper" link using FK. Then execute the goal pose with MoveIt"""
 
     end_link = 'left_gripper'
     kdl_kin = KDLKinematics(robot_description, base_link, end_link)
     robot = Robot(arm, kdl_kin)
+    
+    ### Compute the desired pose of the "left_gripper" link using FK
     pos, temp = robot.get_left_gripper_from_joint_angles(np.array(ik_js))
     euler = np.array([temp[2], -temp[1], -np.pi-temp[0]])
 
 
-    # Planning to a Pose goal
+    ### Compute deltas pos and eulers from the current pose to the desired pose.
     left_current_pose = group.get_current_pose(end_effector_link='left_gripper').pose
-    # left_current_pose = group.get_current_pose(end_effector_link='left_gripper_base').pose
-    # left_current_pose = group.get_current_pose(end_effector_link='laparoscopic_tool_tip').pose
-    # abc = robot.get_ee_cartesian_position()
-    # print(abc[:3], transformations.euler_from_quaternion(abc[3:]))
     
     delta_position = pos - np.array([left_current_pose.position.x,left_current_pose.position.y,left_current_pose.position.z])
     current_euler = transformations.euler_from_quaternion([left_current_pose.orientation.x, left_current_pose.orientation.y, left_current_pose.orientation.z, 
                                                             left_current_pose.orientation.w])
-    print([left_current_pose.position.x,left_current_pose.position.y,left_current_pose.position.z], np.array(current_euler)*180/np.pi)
+    delta_eulers = euler - current_euler  
+    # print([left_current_pose.position.x,left_current_pose.position.y,left_current_pose.position.z], np.array(current_euler)*180/np.pi)                                                          
+    # print("xxxxxxxxxxxdelta_pos, delta_euler:", delta_position, delta_eulers*180/np.pi)
 
-    delta_eulers = euler - current_euler                                                        
-    print("xxxxxxxxxxxdelta_pos, delta_euler:", delta_position, delta_eulers*180/np.pi)
 
+    ### Get waypoints to execute MoveIt Catersian Path. Reference: http://docs.ros.org/en/melodic/api/moveit_tutorials/html/doc/move_group_python_interface/move_group_python_interface_tutorial.html
     waypoints = obtain_waypoints(left_current_pose, delta_position, delta_eulers, num_wp)
 
 
-
+    ### Execute MoveIt
     (plan, fraction) = group.compute_cartesian_path(
                                    waypoints,   # waypoints to follow
                                    0.01,        # eef_step
                                    0.0)         # jump_threshold
     
-    #plan = group.plan()
 
     if not plan.joint_trajectory.points:
         print "[ERROR] No trajectory found"
     else:
-        #group.go(wait=True)
         group.execute(plan, wait=True)
-    # When finished shut down moveit_commander.
-    # moveit_commander.roscpp_shutdown()
-    # moveit_commander.os._exit(0)
-    
-    # print("===================================")
-    # # left_current_pose = group.get_current_pose(end_effector_link='left_gripper').pose
-    # left_current_pose = group.get_current_pose(end_effector_link='laparoscopic_tool_tip').pose
-    # print(left_current_pose)
-    # print(robot.get_ee_cartesian_position())
-    # print("===================================")
-    # return np.array([left_current_pose.position.x, left_current_pose.position.y, left_current_pose.position.z])
-    return np.array([left_current_pose.position.x, left_current_pose.position.y, left_current_pose.position.z, 
-                    left_current_pose.orientation.x, left_current_pose.orientation.y,
-                    left_current_pose.orientation.z, left_current_pose.orientation.w])
+
+    return None
+    # return np.array([left_current_pose.position.x, left_current_pose.position.y, left_current_pose.position.z, 
+    #                 left_current_pose.orientation.x, left_current_pose.orientation.y,
+    #                 left_current_pose.orientation.z, left_current_pose.orientation.w])
 
 
 
@@ -183,15 +177,14 @@ if __name__ == '__main__':
 
     rospy.init_node('moveit_baxter_example', anonymous=True)
 
+
     rs = baxter_interface.RobotEnable(CHECK_VERSION)
     init_state = rs.state().enabled
     print("Enabling robot... ")
     rs.enable()
 
-    # left_arm = baxter_interface.limb.Limb("left")
-    # right_arm = baxter_interface.limb.Limb("right")
 
-
+    ### Set up 
     arm = baxter_interface.Limb('left')
     robot_description = URDF.from_parameter_server()
     base_link = 'world'
@@ -200,30 +193,27 @@ if __name__ == '__main__':
     kdl_kin = KDLKinematics(robot_description, base_link, end_link)
     robot = Robot(arm, kdl_kin)
 
-    delta_pos = np.array([0.0, -0.0, 0.1])
-    # delta_pos = np.array([-0.1, -0.4, -0.1])
-    delta_euler = np.array([0, 0, np.pi/4]) # euler order: standing opposite - roll, pitch, yaw
+    ### Desired displacements
+    delta_pos = np.array([-0.0, -0.0, -0.1])
+    delta_euler = np.array([0, 0, -np.pi/4]) # euler order: standing opposite - roll, pitch, yaw
 
     rospy.sleep(1)
-    init_ee = robot.get_ee_cartesian_position()
+    init_ee = robot.get_ee_cartesian_position()   # Cache initial end-effector pose
 
     try:
         final_ee = moveit_baxter_example(delta_pos, delta_euler, num_wp=2)
     except rospy.ROSInterruptException:
         pass
 
-
-
-
     rospy.sleep(1)
-    final_ee = robot.get_ee_cartesian_position()
-    # pose = deepcopy(group.get_current_pose(end_effector_link='left_gripper').pose.position)
-    # final_ee = np.array([pose.x, pose.y, pose.z])
+    final_ee = robot.get_ee_cartesian_position()   # Cache final end-effector pose
+    
+    ### Compute actual dispalcements to confirm that the robot is operating properly.
     print("diff_ee pos:", final_ee[:3] - init_ee[:3])
     print("diff_ee euler:", 180/np.pi*np.array(transformations.euler_from_quaternion(final_ee[3:])) - 180/np.pi*np.array(transformations.euler_from_quaternion(init_ee[3:])))
     print("----------------------------")
     print("final_ee pos:", final_ee[:3])
     print("final_ee quat:", final_ee[3:])
-    # print("init_ee:", init_ee)
+
 
 

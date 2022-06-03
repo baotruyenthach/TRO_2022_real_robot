@@ -1,0 +1,3 @@
+---
+float64[] desired_pos   # delta x y z output from DeformerNet
+# bool success       # valid point cloud are captured
